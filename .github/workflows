@@ -1,1 +1,141 @@
+name: Automated Vulnerability Remediation Loop
+
+on:
+  workflow_dispatch:         # manual trigger
+  schedule:
+    - cron: "0 */6 * * *"    # every 6 hours (loop scan cycle)
+
+env:
+  AWS_REGION: ap-south-1
+  IMAGE_NAME: srilekha-remediation
+  BUCKET_NAME: srilekha-terraform-test-bucket
+
+jobs:
+  terraform_deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.5
+
+      - name: Initialize Terraform
+        run: terraform init
+
+      - name: Apply Terraform (Infra Creation)
+        run: terraform apply -auto-approve
+
+  docker_build:
+    needs: terraform_deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker Image
+        run: docker build -t ${{ env.IMAGE_NAME }}:latest .
+
+      - name: Save Docker Image
+        run: docker save ${{ env.IMAGE_NAME }}:latest -o image.tar
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: image.tar
+
+  trivy_scan:
+    needs: docker_build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Docker Image
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+
+      - name: Load Docker Image
+        run: docker load -i image.tar
+
+      - name: Install Trivy
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install wget -y
+          wget https://github.com/aquasecurity/trivy/releases/latest/download/trivy_Linux-64bit.tar.gz
+          tar zxvf trivy_Linux-64bit.tar.gz
+          sudo mv trivy /usr/local/bin/
+
+      - name: Run Trivy Scan
+        id: trivy
+        run: |
+          trivy image ${{ env.IMAGE_NAME }}:latest --exit-code 1 --severity HIGH,CRITICAL || echo "vulnerable=true" >> $GITHUB_ENV
+
+  notify_approval:
+    needs: trivy_scan
+    if: env.vulnerable == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Email Notification for Approval
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: Srilekhasrii
+          password: Codingfun@12345
+          subject: "⚠️ Vulnerabilities Detected in Docker Image"
+          to: "yourmail@example.com"
+          from: "GitHub Actions <${{ secrets.EMAIL_USERNAME }}>"
+          body: |
+            Hello Srilekha 👋,
+
+            The Trivy scan found vulnerabilities in **${{ env.IMAGE_NAME }}:latest**.
+
+            👉 Please review and approve remediation:
+
+            🔗 Approve Remediation:
+            https://github.com/${{ github.repository }}/actions/workflows/remediation-loop.yml
+
+            🧾 Status: Vulnerable
+            📦 Image: ${{ env.IMAGE_NAME }}
+
+            Once approved, the remediation process will rebuild and redeploy automatically.
+
+      - name: Wait for Manual Approval
+        uses: trstringer/manual-approval@v1
+        with:
+          approvers: "Srilekhasrii"
+          minimum-approvals: 1
+          timeout-minutes: 30
+
+  remediation:
+    needs: notify_approval
+    if: env.vulnerable == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Rebuild Docker Image (Patched)
+        run: docker build --no-cache -t ${{ env.IMAGE_NAME }}:latest .
+
+      - name: Push Remediated Image to ECR (Optional)
+        run: echo "Push to AWS ECR or Docker Hub"
+
+      - name: Redeploy Terraform
+        run: |
+          terraform init
+          terraform apply -auto-approve
+
+      - name: Trigger Next Scan
+        run: echo "Remediation completed. Will re-scan in next scheduled run 🔁"
+
+  clean_scan:
+    needs: trivy_scan
+    if: env.vulnerable != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: No vulnerabilities found
+        run: echo "✅ No issues found. Will re-scan in next cycle."
 
